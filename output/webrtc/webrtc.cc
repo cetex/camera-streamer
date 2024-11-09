@@ -48,6 +48,11 @@ static rtc::Configuration webrtc_configuration = {
   .disableAutoNegotiation = true
 };
 
+static void webrtc_remove_client(const std::shared_ptr<Client> &client, const char *reason);
+
+std::shared_ptr<Client> webrtc_find_client(std::string id);
+
+
 struct ClientTrackData
 {
   std::shared_ptr<rtc::Track> track;
@@ -95,6 +100,7 @@ public:
     }
     id = "rtc-" + id;
     name = strdup(id.c_str());
+    last_heartbeat_s = get_monotonic_time_us(NULL, NULL) / 1000 / 1000;
   }
 
   ~Client()
@@ -126,6 +132,17 @@ public:
         device_video_force_key(buf->buf_list->dev);
         requested_key_frame = true;
       }
+      return;
+    }
+
+    // Remove client if last ReceiverReport received more then client_timeout ago
+    uint64_t now_s = get_monotonic_time_us(NULL, NULL) / 1000 / 1000;
+    uint64_t heartbeat_delta = now_s - last_heartbeat_s;
+    if (heartbeat_delta >= client_timeout) {
+      std::unique_lock lk(webrtc_clients_lock);
+      webrtc_remove_client(webrtc_find_client(id), "No heartbeat from client");
+      //LOG_INFO(client.get(), "No heartbeat from client, removed.");
+      //webrtc_remove_client(this, "No heartbeat from client, removing.");
       return;
     }
 
@@ -171,6 +188,8 @@ public:
   bool has_set_sdp_answer = false;
   bool had_key_frame = false;
   bool requested_key_frame = false;
+  uint64_t client_timeout = 10;
+  uint64_t last_heartbeat_s;
 };
 
 std::shared_ptr<Client> webrtc_find_client(std::string id)
@@ -402,12 +421,29 @@ static void http_webrtc_offer(http_worker_t *worker, FILE *stream, const nlohman
 
   auto offer = rtc::Description(std::string(message["sdp"]), std::string(message["type"]));
   auto client = webrtc_peer_connection(webrtc_configuration, message);
+  auto wclient = std::weak_ptr(client);
 
   LOG_INFO(client.get(), "Offer received.");
   LOG_VERBOSE(client.get(), "Remote SDP Offer: %s", std::string(message["sdp"]).c_str());
 
   try {
     client->video = webrtc_add_video(client->pc, webrtc_client_video_payload_type, rand(), "video", "");
+
+    // Add handler storing timestamp of last RTCP ReceiverReport
+    client->video->track->onMessage(
+      [wclient](rtc::binary message) {
+        auto header = reinterpret_cast<rtc::RtcpHeader *>(message.data());
+
+	assert(header->payloadType() == rtc::Message::Type::Control);
+
+        // This is an RTCP packet
+        //auto rtp = reinterpret_cast<rtc::RtpHeader *>(message.data());
+
+        auto client = wclient.lock();
+
+        client->last_heartbeat_s = get_monotonic_time_us(NULL, NULL) / 1000 / 1000;
+      },
+      nullptr);
 
     {
       std::unique_lock lock(client->lock);
